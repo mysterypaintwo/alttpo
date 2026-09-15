@@ -3,6 +3,45 @@ const uint MaxPacketSize = 1452;
 
 const uint OverworldAreaCount = 0x82;
 
+// Bit layout reference for mxf_force_dmx_strip() below (see xfusionvariable1/2/3Names
+// in SyncableItem.as):
+//   suits (0x02): bit0 Varia, bit1 Lv.2 Missile (Super Missile), bit2 Morph Ball,
+//                 bit3 Screw Attack, bit4 Lv.4 Missile (Diffusion Missile),
+//                 bit5 Gravity Suit, bit6 unused, bit7 Spike Breaker
+//   boots (0x03): bit0 Super Jump, bit1 Space Jump, bit2 unused,
+//                 bit3 Lv.2 Speed Booster, bit4 Bombs, bit5 Lv.1 Speed Booster,
+//                 bit6 Grapple Beam, bit7 Lv.3 Missile (Ice Missile)
+//   beams (0x06): bit0 Wave Beam, bit1 Ice Beam, bit2 Wide Beam, bit3 Plasma
+const uint8 MxfSuitsBit_Lv2Missile = 0x02;
+const uint8 MxfSuitsBit_Lv4Missile = 0x10;
+const uint8 MxfBootsBit_Grapple    = 0x40;
+const uint8 MxfBootsBit_Lv3Missile = 0x80;
+const uint8 MxfBeamsBit_Wave       = 0x01;
+
+// mxf_enforce_dmx_lockout()'s post-disconnect strip re-assertion window:
+const uint MxfDmxStripIntervalFrames = 20;   // re-strip every 20 frames...
+const uint MxfDmxStripWindowFrames = 3600;   // ...for about a minute at 60fps
+
+// Predictive DMX-entry detection (see mxf_about_to_enter_dmx()): identifies the one
+// specific MDK room/door pair that transitions into DMX, confirmed via the X-Fusion
+// practice-hack ROM's defines.asm (!ROOM_ID = $079B, !DOOR_ID = $078D) and, decisively,
+// by live-testing every door transition: room=80f6 door=8dd4 was the transition
+// immediately followed by sm_area flipping to 07 (DMX).
+// NOTE: DOOR_ID lags -- it holds whatever door was LAST used until the next actual
+// door transition, so right after simply walking INTO 80F6 from elsewhere it still
+// reads that entrance door's ID, not "the other door in the room". An exact match
+// against the confirmed DMX-bound door is required; "not equal to some other door ID"
+// is not sufficient, since any different entrance into the room reads as "not equal"
+// too and would false-trigger just from visiting.
+const uint16 MxfDmxEntryRoomId = 0x80F6;
+const uint16 MxfDmxEntryDoorId = 0x8DD4;
+
+// WRAM $7ED820 bits 0x02/0x04/0x08/0x10/0x20/0x40 (SRX/TRO/PYR/AQA/ARC/NOC Aux Power
+// Engaged), confirmed via the X-Fusion practice-hack's mainmenu.asm debug-menu toggle
+// bits. All six set -- required to ever reach the DMX door in the first place, checked
+// here purely as extra confirmation, not as the primary signal.
+const uint8 MxfAllAuxEngagedMask = 0x7E;
+
 class ALTTPSRAMArray : SRAMArray {
 
   ALTTPSRAMArray(array<uint8>@ sram) {
@@ -2502,6 +2541,9 @@ class LocalGameState : GameState {
         if (remote is this) continue;
         if (remote.ttl <= 0) continue;
         if (remote.team != team) continue;
+        // never sync items to/from a player who's in DMX or mid MDK-alarm -- see
+        // is_mxf_locked_out() (no-op for non-mxf ROMs):
+        if (is_mxf_locked_out(remote)) continue;
 
         // apply the remote values:
         if (!syncable.is_sm){syncable.apply(d, @SRAMArray(remote.sram));}
@@ -3284,42 +3326,271 @@ class LocalGameState : GameState {
     p = send_packet(envelope, p);
   }
 
-  // true while the local player is physically standing in the DMX sector itself
-  // ($7E079F). Item capacities and game flags must not be synced from other players
-  // during this window, or the MDK alarm / "return from DMX" sequence can desync and
-  // softlock the local player. Always false for non-mxf ROMs (vanilla SM/SMZ3 have no
-  // DMX sector).
-  //
-  // NOTE: this deliberately does NOT also check sm_events[MxfEventIdx_CurrentArea] (WRAM
-  // 0x7ED820), even though that mirrors the same 0-7 area encoding. That byte is merged
-  // across the whole team with max() (see update_sm_events()), so it only ever goes up --
-  // once any teammate's area value reaches DMX even briefly, it latches there permanently
-  // for the entire team, which would make this lockout permanent instead of temporary.
-  // sm_area, read fresh from WRAM every frame, is the only part of this that's actually
-  // transient.
+  // true once the local player has been (permanently) locked out of X-Fusion DMX/MDK-
+  // alarm syncing -- see is_mxf_locked_out() in GameState.as for the actual condition
+  // and the permanent-latch rationale. Item capacities and game flags must not be
+  // synced from other players once this trips, or the MDK alarm / "return from DMX"
+  // sequence can desync and softlock the local player. Always false for non-mxf ROMs
+  // (vanilla SM/SMZ3 have no DMX sector); applies regardless of this seed's "Skip DMX"
+  // option, since all of Samus' upgrades get removed on entering DMX either way.
   bool is_mxf_dmx_lockout() {
-    if (!rom.is_mxf()) return false;
-    if (!get_in_sm()) return false;
-    if (sm_area == MxfSectorDMX) return true;
-    return false;
+    return is_mxf_locked_out(this);
   }
 
-  // WRAM 0x7ED820 (MxfEventIdx_CurrentArea) is a plain value, not a bitfield -- notify
-  // once when it newly settles on one of the six "Aux Power Engaged" areas. MDK (0, the
-  // starting area) and DMX (7, handled by the alarm/lockout logic) don't get this
-  // notification, matching the areas that actually have an "Aux Power Engaged" event.
+  // previous frame's suits/beams bytes, for check_mxf_equipment_wipe() below.
+  // mxf_last_beams has the Wave Beam bit already masked out (the wipe-detection logic
+  // ignores that bit); mxf_last_beams_raw tracks the same byte unmasked, purely so the
+  // true pre-wipe Wave Beam state can be recovered below.
+  uint8 mxf_last_suits = 0;
+  uint8 mxf_last_beams = 0;
+  uint8 mxf_last_beams_raw = 0;
+
+  // whether the player had Wave Beam equipped the instant before the wipe was first
+  // observed -- captured once, in check_mxf_equipment_wipe(), since mxf_last_beams_raw
+  // itself keeps tracking the post-wipe (zeroed) value on every later frame. Used by
+  // mxf_force_dmx_strip() to decide whether Wave Beam needs to be force-granted.
+  bool mxf_had_wave_before_wipe = false;
+
+  // Primary DMX-entry detection: identifies the DMX entry transition itself (the
+  // specific MDK room/door pair, mid-transition, with all 6 auxiliaries engaged)
+  // instead of waiting for the item wipe to already be visible in WRAM. When this
+  // fires, the player still has their FULL legitimate inventory -- there is nothing
+  // to strip, and no race to close, since we disconnect before the wipe (which the
+  // game performs entirely on its own, later, once inside DMX) has any chance to
+  // happen while still connected. See MxfDmxEntryRoomId/MxfDmxEntryDoorId/
+  // MxfAllAuxEngagedMask above for how these were identified.
+  //
+  // Confirmed via a clean START/ARRIVED log pair: "transition STARTED -- room=80f6
+  // door=8dd4 ... sm_state=0b" (still shows the departure room, door already updated
+  // to the one just used) was immediately followed by "transition ARRIVED -- room=c05f
+  // door=8dd4 ... sm_area=07" -- i.e. this exact room+door pair, captured at the START
+  // of the transition, reliably precedes DMX. The same test also showed a remote's
+  // sync land mid-transition, before sm_area ever reflected DMX -- confirming this
+  // predictive check catches it strictly earlier than check_mxf_equipment_wipe()
+  // below, which mxf_enforce_dmx_lockout() only falls back to when this misses (e.g.
+  // an as-yet-unmapped way into DMX that doesn't go through this specific door).
+  bool mxf_about_to_enter_dmx() {
+    if (!rom.is_mxf()) return false;
+    if (!get_in_sm()) return false;
+    if (!sm_loading_room()) return false;
+    if (bus::read_u16(0x7E079B) != MxfDmxEntryRoomId) return false;
+    if (bus::read_u16(0x7E078D) != MxfDmxEntryDoorId) return false;
+    if ((sm_events[MxfEventIdx_CurrentArea] & MxfAllAuxEngagedMask) != MxfAllAuxEngagedMask) return false;
+    return true;
+  }
+
+  // Fallback used only when mxf_about_to_enter_dmx() above doesn't catch DMX entry
+  // (e.g. a way into DMX that doesn't go through the one mapped door). Catches the
+  // equipment wipe the instant it happens in WRAM instead, rather than waiting for
+  // sm_area to mirror $7E079F == DMX. In practice the equipped-item bytes ($7E09A2
+  // offsets 0x02 suits, 0x06 beams) go to zero at least one frame before area catches
+  // up, and update_items() -- which merges in teammates' still-full inventory -- only
+  // runs every 16th frame, so without this a teammate's data can land in that window
+  // and hand the local player's full inventory right back while they're already
+  // physically standing in DMX, which must never happen. This must be called every
+  // frame local.sm_sram is refreshed from live WRAM (pre_frame.as, on_main_sm), BEFORE
+  // update_items() next gets a chance to run, so the permanent lockout latch
+  // (mxf_dmx_locked, shared with is_mxf_locked_out()) is set in time to block that
+  // merge. Wave Beam (bit 0 of the beams byte) is excluded from the check since the
+  // player keeps/receives it regardless of DMX; Grapple Beam lives in the separate
+  // "boots" byte, which isn't watched here.
+  void check_mxf_equipment_wipe() {
+    if (!rom.is_mxf()) return;
+    if (!get_in_sm()) return;
+
+    uint8 suits = sm_sram[0x02];
+    uint8 beams = sm_sram[0x06] & ~uint8(0x01);
+
+    bool hadEquipment = (mxf_last_suits != 0) || (mxf_last_beams != 0);
+    bool nowStripped = (suits == 0) && (beams == 0);
+
+    // NOTE: deliberately NOT also requiring sm_loading_room()/sm_area==DMX here.
+    // Confirmed by live testing: the equipment wipe can already be sitting in WRAM
+    // for a full 16-frame update_items() cycle -- long enough for a teammate's sync
+    // to hand the wiped items right back -- before EITHER sm_state or sm_area catches
+    // up to reflect it. Simultaneously losing every suit/beam bit at once (having had
+    // any before) does not happen in this ROM outside the DMX quarantine, so the
+    // transition alone is a reliable enough signal on its own.
+    if (hadEquipment && nowStripped) {
+      mxf_had_wave_before_wipe = (mxf_last_beams_raw & MxfBeamsBit_Wave) != 0;
+      mxf_dmx_locked = true;
+    }
+
+    mxf_last_suits = suits;
+    mxf_last_beams = beams;
+    mxf_last_beams_raw = sm_sram[0x06];
+  }
+
+  // Forcibly strips the local player back to the exact X-Fusion DMX quarantine
+  // loadout: every suit/boot/beam item removed except Grapple Beam (forced ON
+  // regardless of prior possession -- mandatory for the Gold Gadora-X/equipment-
+  // return sequence) and Wave Beam (see below), and the missile-upgrade ladder
+  // (Super/Ice/Diffusion Missile, collectible in any order) reduced by exactly one
+  // step -- if none of those three are equipped, it's already at the floor and is
+  // left alone. Missile/PB/Energy/Reserve-X capacities are real per-player resources
+  // in X-Fusion (there is only one missile counter -- no separate super missile
+  // tanks) and are left untouched. This is a hard failsafe, called repeatedly for a
+  // limited window (see mxf_enforce_dmx_lockout()) -- it corrects for anything a
+  // remote's sync already leaked back in before the lockout latch could take effect.
+  void mxf_force_dmx_strip() {
+    uint8 suits = sm_sram[0x02];
+    uint8 boots = sm_sram[0x03];
+
+    if ((suits & MxfSuitsBit_Lv4Missile) != 0) suits &= ~MxfSuitsBit_Lv4Missile;
+    else if ((boots & MxfBootsBit_Lv3Missile) != 0) boots &= ~MxfBootsBit_Lv3Missile;
+    else if ((suits & MxfSuitsBit_Lv2Missile) != 0) suits &= ~MxfSuitsBit_Lv2Missile;
+
+    suits = suits & (MxfSuitsBit_Lv2Missile | MxfSuitsBit_Lv4Missile);
+    boots = (boots & MxfBootsBit_Lv3Missile) | MxfBootsBit_Grapple;
+
+    auto @d = @SMSRAMArray(@sm_sram);
+    d.write_u8(0x02, suits);
+    d.write_u8(0x03, boots);
+
+    // Ice/Wide/Plasma always get stripped. Wave Beam is mandatory for the Gold
+    // Gadora-X/equipment-return sequence, so it's always force-granted if the player
+    // didn't already have it, and always force-granted regardless of prior possession
+    // when this seed's DMX sector isn't skippable (Skip DMX = Off). It's only left
+    // exactly as the game currently has it (whatever that is) when the player already
+    // had it AND Skip DMX is on.
+    uint8 beams = 0;
+    if (!mxf_had_wave_before_wipe || !rom.mxf_skip_dmx()) {
+      beams = MxfBeamsBit_Wave;
+    } else {
+      beams = sm_sram[0x06] & MxfBeamsBit_Wave;
+    }
+    d.write_u8(0x06, beams);
+    d.write_u8(0x07, 0); // charge beam
+  }
+
+  // true once we've disconnected for this lockout episode -- from that point on,
+  // mxf_enforce_dmx_lockout() only runs the post-disconnect strip re-assertion below,
+  // never re-detects or re-disconnects.
+  bool mxf_dmx_handled = false;
+
+  // counts frames since we disconnected, while re-asserting the DMX strip below.
+  uint mxf_dmx_post_disconnect_frames = 0;
+
+  // Runs every safe frame (see pre_frame.as). Checks, in order: mxf_about_to_enter_dmx()
+  // (primary -- predicts DMX entry before any wipe happens), then, only if that misses,
+  // check_mxf_equipment_wipe() (fallback -- reacts to the wipe already being in WRAM),
+  // then confirms/latches via is_mxf_locked_out() (which also independently catches the
+  // live sm_area/MDK-alarm-bit condition on its own, in case neither of the above ever
+  // ran for this player). The moment any of these latches for the local player, this
+  // tells teammates we're leaving, disconnects from the server outright, and -- ONLY
+  // if the predictive check is what missed and the fallback had to react to an
+  // already-visible wipe -- THEN begins forcibly re-asserting the correct DMX-
+  // quarantine inventory every 20 frames for about a minute.
+  //
+  // Order matters: nothing gets stripped until AFTER the connection is actually
+  // severed. A remote that keeps re-sending data this client is supposed to ignore is
+  // still a live risk for as long as the connection stays open, so stripping first and
+  // disconnecting after would leave a window where one more incoming packet re-grants
+  // the very items just removed. Repeating the strip (instead of once) guards against
+  // a single attempt landing on a frame where it doesn't stick -- the interval is
+  // counted in actual emulated frames (incremented once per pre_nmi(), not a wall
+  // clock), so turbo/fast-forward speeds still get the same number of checks, just
+  // compressed into less real time.
+  //
+  // The window is deliberately finite, not permanent: entering DMX is meant to be
+  // survivable even without networking involved at all -- confirmed the game's own
+  // native sequence has the player naturally receive an item at Gold Gadora-X, then
+  // get their full equipment back, before the MDK Alarm fires, and this must be
+  // allowed to complete normally. Re-stripping needs to cover only the window where a
+  // leaked remote sync is actually possible; once that risk has passed, this must get
+  // out of the way entirely so it never fights that native restoration sequence. When
+  // the predictive check is what caught it, there's no risk window to cover at all --
+  // the player still has their full inventory, so the strip window is skipped outright.
+  void mxf_enforce_dmx_lockout() {
+    if (!rom.is_mxf()) return;
+
+    if (mxf_dmx_handled) {
+      if (mxf_dmx_post_disconnect_frames < MxfDmxStripWindowFrames) {
+        if ((mxf_dmx_post_disconnect_frames % MxfDmxStripIntervalFrames) == 0) {
+          mxf_force_dmx_strip();
+        }
+        mxf_dmx_post_disconnect_frames++;
+      }
+      return;
+    }
+
+    bool predictedEarly = mxf_about_to_enter_dmx();
+    if (predictedEarly) {
+      mxf_dmx_locked = true;
+    } else {
+      check_mxf_equipment_wipe();
+    }
+    if (!is_mxf_locked_out(this)) return;
+
+    mxf_dmx_handled = true;
+
+    notify("Entered DMX (Auto-Disconnected from Server)");
+
+    // tell other players we're leaving, just before actually leaving: there's no
+    // dedicated "goodbye"/chat packet in this protocol, and inventing a new packet
+    // kind risks any peer not running this exact script silently dropping the rest of
+    // that network envelope (the dispatcher has no safe way to skip an unrecognized
+    // kind byte) -- so reuse the existing name-sync wire format (kind 0x0C) every
+    // client already understands, sent immediately (bypassing send()'s normal rate
+    // limit) so it actually goes out before the socket closes:
+    if (sock !is null) {
+      string originalName = name;
+      namePadded = originalName + " Left (Entered DMX)";
+      auto @envelope = make_packet_broadcast();
+      serialize_name(envelope);
+      send_packet(envelope, 0);
+    }
+
+    if (sock !is null) { sock.close(); }
+    settings.disconnect();
+
+    // Only run the post-disconnect strip re-assertion window when we got here via the
+    // REACTIVE path (the wipe already happened, possibly with a leaked sync to
+    // correct for). When predictedEarly fired instead, the player still has their
+    // full legitimate inventory at this exact moment -- forcibly stripping it
+    // ourselves would just get ahead of the game's own wipe sequence and risk
+    // desyncing it. Setting the counter straight to the window length is a no-op skip
+    // (the `< MxfDmxStripWindowFrames` check in the handled-branch above never opens).
+    //
+    // The reactive path running any code at all after disconnect is not the expected
+    // case (the predictive door check above should normally catch DMX entry before
+    // any of this is needed) -- keep this one log line as a safety-net signal that it
+    // happened, without spamming a message on every 20-frame re-strip tick.
+    if (predictedEarly) {
+      mxf_dmx_post_disconnect_frames = MxfDmxStripWindowFrames;
+    } else {
+      message("X-Fusion: DMX lockout via fallback detection (predictive door check did not catch it) -- correcting inventory over the next minute.");
+      mxf_dmx_post_disconnect_frames = 0;
+    }
+  }
+
+  // WRAM 0x7ED820 (MxfEventIdx_CurrentArea) holds six INDEPENDENT per-area "Aux Power
+  // Engaged" bit flags in bits 1-6 (0x02 SRX, 0x04 TRO, 0x08 PYR, 0x10 AQA, 0x20 ARC,
+  // 0x40 NOC) -- tested and confirmed live. Bit position equals area index (see
+  // MxfArea_SRX..MxfArea_NOC), which mxfAreaNames is also indexed by, so each newly-set
+  // bit maps directly to the right name. Notifies once per bit that newly transitions
+  // from 0 to 1. Bit 7 (MxfMdkAlarmBit) is masked off first since it's an unrelated
+  // per-player toggle packed into the same byte, not one of the six area flags.
   void notify_mxf_area_engaged(uint8 oldValue, uint8 newValue) {
+    oldValue &= ~MxfMdkAlarmBit;
+    newValue &= ~MxfMdkAlarmBit;
     if (oldValue == newValue) return;
-    if (newValue < MxfArea_SRX || newValue > MxfArea_NOC) return;
-    notify("Auxiliary Engaged (" + mxfAreaNames[newValue] + ")");
+    for (uint8 areaIdx = MxfArea_SRX; areaIdx <= MxfArea_NOC; areaIdx++) {
+      uint8 mask = uint8(1) << areaIdx;
+      if ((oldValue & mask) != 0) continue;
+      if ((newValue & mask) == 0) continue;
+      notify("Auxiliary Engaged (" + mxfAreaNames[areaIdx] + ")");
+    }
   }
 
   // scans every entry in mxfFlagNotes and notifies for each one whose bit newly
   // transitioned from 0 to 1 between oldEvents and the current sm_events (i.e. as a
   // result of merging in another player's flags -- see update_sm_events()).
   void notify_mxf_flags(const array<uint8> @oldEvents) {
+    if (mxfFlagNotes is null) return;
     for (uint n = 0; n < mxfFlagNotes.length(); n++) {
       auto @note = mxfFlagNotes[n];
+      if (note is null) continue;
       if (note.notified) continue;
       uint8 mask = uint8(1) << note.bit;
       if ((oldEvents[note.idx] & mask) != 0) continue;
@@ -3351,12 +3622,27 @@ class LocalGameState : GameState {
       if (remote is local) continue;
       if (remote.ttl <= 0) continue;
       if (remote.team != team) continue;
+      // never sync flags to/from a player who's in DMX or mid MDK-alarm -- see
+      // is_mxf_locked_out() (no-op for non-mxf ROMs):
+      if (is_mxf_locked_out(remote)) continue;
 
       for (int j = 0; j < SmEventsSize; j++) {
         if (isMxf && j == MxfEventIdx_CurrentArea) {
-          // not a bitfield: OR-ing two valid area values together can produce a third
-          // value neither player actually has, so take the higher of the two instead.
-          if (remote.sm_events[j] > sm_events[j]) sm_events[j] = remote.sm_events[j];
+          // Bits 1-6 (0x02/0x04/0x08/0x10/0x20/0x40) are six INDEPENDENT per-area
+          // "Aux Power Engaged" flags (SRX/TRO/PYR/AQA/ARC/NOC), not a sequential 0-7
+          // value -- tested and confirmed live: completing SRX alone produced
+          // "Auxiliary Engaged (TRO)", because the byte's numeric value after setting
+          // just SRX's bit is 2, and the old code indexed the area-name table by that
+          // raw value instead of by which bit was set. OR-merging these bits is
+          // correct (each is an independent, monotonic "this got done" flag, same as
+          // every other flag byte here) -- the previous max()-based merge could
+          // actually lose a teammate's progress outright: two players who'd each
+          // completed a different aux would merge to whichever raw byte value was
+          // numerically larger, discarding the other's bit entirely. Bit 7
+          // (MxfMdkAlarmBit) is still excluded from the merge -- it's each player's
+          // own live alarm toggle, never spread across the team.
+          uint8 merged = (sm_events[j] | remote.sm_events[j]) & ~MxfMdkAlarmBit;
+          sm_events[j] = merged | (sm_events[j] & MxfMdkAlarmBit);
         } else {
           sm_events[j] = remote.sm_events[j] | sm_events[j];
         }

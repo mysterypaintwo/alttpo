@@ -256,15 +256,35 @@ const int SmEventsSize = SmEventsBlock3Offset + SmEventsBlock3Size; // 0x55
 // vanilla SM/SMZ3 have different, unrelated flags at these same WRAM addresses, so
 // every place that reads these must first check rom.is_mxf().
 //
-// NOTE: unlike the other mxf bytes here, WRAM 0x7ED820 (MxfEventIdx_CurrentArea) is NOT
-// a bitfield -- it's a single "current area" value 0-7 (0=MDK, 1=SRX, 2=TRO, 3=PYR,
-// 4=AQA, 5=ARC, 6=NOC, 7=DMX). It must never be merged with bitwise OR like the other
-// bytes (OR-ing two valid small integers together can produce a third value neither
-// player actually has); see update_sm_events() in LocalGameState.as, which
-// special-cases this index (only for mxf ROMs) to take the higher of the two instead.
+// WRAM 0x7ED820 (MxfEventIdx_CurrentArea) holds six INDEPENDENT per-area "Aux Power
+// Engaged" bit flags in bits 1-6 (0x02 SRX, 0x04 TRO, 0x08 PYR, 0x10 AQA, 0x20 ARC,
+// 0x40 NOC) -- tested and confirmed live: an earlier version of this code treated the
+// byte as one sequential 0-7 "current area" value and indexed the area-name table by
+// its raw numeric value, so completing SRX alone (byte value 2) displayed "Auxiliary
+// Engaged (TRO)" instead of "(SRX)", since mxfAreaNames[2] is "TRO". Bit position
+// equals area index (bit 1 = MxfArea_SRX, ..., bit 6 = MxfArea_NOC), which
+// mxfAreaNames is indexed by; MxfArea_MDK (0) and MxfArea_DMX (7) are NOT bits in this
+// byte -- they're only meaningful for $7E079F/sm_area, a separate address for the
+// player's current physical location. Each bit is an independent, monotonic "this got
+// done" flag, so it's merged across the team with plain OR, same as every other flag
+// byte here (see update_sm_events() in LocalGameState.as) -- an earlier version
+// special-cased this index to take the numerically higher of the two raw byte values
+// instead, which could actually lose a teammate's progress outright: two players who'd
+// each completed a different aux would merge to whichever raw value was numerically
+// larger, discarding the other's bit entirely.
+//
+// Bit 7 (MxfMdkAlarmBit) of this SAME byte, however, IS a genuine bit toggle: the
+// "MDK Alarm / Return from DMX" flag, unrelated to the six area flags. It must be
+// masked off before merging the area bits (else it would "win" every merge and end up
+// forced onto every teammate's WRAM), and must never be merged in from teammates at
+// all -- each player's own alarm state is local to their own game. See
+// update_sm_events() in LocalGameState.as.
 const int MxfEventIdx_CurrentArea  = 0x7ED820 - 0x7ED820;
 
-// X-Fusion "current area" values (see MxfEventIdx_CurrentArea above and $7E079F sm_area):
+// X-Fusion area indices. MxfArea_SRX..MxfArea_NOC double as bit positions within
+// MxfEventIdx_CurrentArea's "Aux Power Engaged" byte (see above); MxfArea_MDK and
+// MxfArea_DMX are meaningful only for $7E079F/sm_area (the player's current physical
+// location), not for that byte.
 const uint8 MxfArea_MDK = 0;
 const uint8 MxfArea_SRX = 1;
 const uint8 MxfArea_TRO = 2;
@@ -275,6 +295,37 @@ const uint8 MxfArea_NOC = 6;
 const uint8 MxfArea_DMX = 7;
 
 const uint8 MxfSectorDMX = MxfArea_DMX; // value of WRAM 0x7E079F while in the DMX sector
+
+// WRAM 0x7ED820 bit 7 (part of MxfEventIdx_CurrentArea's byte): "MDK Alarm / Return from
+// DMX" flag. A real per-player bit toggle, unrelated to the 0-7 area value in the low
+// bits of the same byte.
+const uint8 MxfMdkAlarmBit = 0x80;
+
+// Gates syncing data to/from the given player (local or remote): true if that player
+// has ever been observed (locally, by this client) either physically standing in the
+// DMX sector ($7E079F == MxfSectorDMX, mirrored fresh every frame into sm_area) or
+// mid MDK-alarm/return-from-DMX (WRAM 0x7ED820 bit 7, MxfMdkAlarmBit). The very first
+// time either condition is seen for a player, the lockout latches permanently via
+// p.mxf_dmx_locked -- it is never re-cleared for the life of that player's GameState
+// object, since the flakiness of these signals (see MxfEventIdx_CurrentArea's max()
+// merge note above) makes a live-only check unreliable to bounce back off of. Other
+// players are unaffected and continue syncing normally.
+//
+// Always false for non-mxf ROMs. NOTE: this must trip regardless of this seed's
+// "Skip DMX" option (rom.mxf_skip_dmx()) -- per the option's own description, ALL of
+// Samus' upgrades get removed on entering DMX either way; the option only changes what
+// happens immediately afterward (instant Gold Gadora-X access when on, vs. being
+// granted just Grappling Beam when off). It does not make DMX safe to sync through.
+bool is_mxf_locked_out(GameState @p) {
+  if (!rom.is_mxf()) return false;
+  if (p.mxf_dmx_locked) return true;
+  if (!p.get_in_sm()) return false;
+  if (p.sm_area == MxfSectorDMX || (p.sm_events[MxfEventIdx_CurrentArea] & MxfMdkAlarmBit) != 0) {
+    p.mxf_dmx_locked = true;
+    return true;
+  }
+  return false;
+}
 
 class GameState {
   int ttl;        // time to live for last update packet
@@ -377,6 +428,12 @@ class GameState {
   //coordinates for super metroid game
   uint8 sm_area, sm_sub_x, sm_sub_y, sm_x, sm_y;
   uint8 sm_room_x, sm_room_y, sm_pose, sm_anim_frame;
+
+  // X-Fusion DMX/MDK-alarm permanent sync lockout latch for THIS player, as observed
+  // locally. Never sent over the network -- each client decides independently, from
+  // whatever it can already see of this player (sm_area, sm_events), whether to
+  // permanently stop syncing with them. See is_mxf_locked_out() below.
+  bool mxf_dmx_locked = false;
   uint16 sm_screen_x, sm_screen_y;
   uint16 offsm1, offsm2;
   uint8 in_sm;

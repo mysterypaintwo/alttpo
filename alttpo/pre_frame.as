@@ -185,6 +185,12 @@ void on_main_sm(uint32 pc) {
     bus::read_block_u8(0x7E09A2, 0, 0x40, local.sm_sram);
     if (rom.is_alttp()){bus::read_block_u8(0xA17B00, 0x300, 0x100, local.sram);}
     local.fetch_sm_events();
+
+    // check every safe frame (not just the once-every-16-frames update_items() runs
+    // on) so the X-Fusion DMX lockout can disconnect from the server as early as
+    // possible -- ideally before DMX entry even completes -- see
+    // mxf_enforce_dmx_lockout() (no-op for non-mxf ROMs):
+    local.mxf_enforce_dmx_lockout();
   }
 
   if (!settings.started) {

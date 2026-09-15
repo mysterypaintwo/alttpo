@@ -29,6 +29,9 @@ abstract class ROMMapping {
   // true only for the Metroid X-Fusion romhack (mxf); false for vanilla SM and SMZ3,
   // which also answer is_sm()==true but have a different WRAM game-flag layout.
   bool is_mxf() { return false; }
+  // X-Fusion "Skip DMX" seed option (see MetroidXFusionMapping.skip_dmx); always false
+  // for non-mxf ROMs.
+  bool mxf_skip_dmx() { return false; }
   void register_pc_intercepts() {
     // intercept at PC=`JSR ClearOamBuffer; JSL MainRouting`:
     cpu::register_pc_interceptor(rom.fn_pre_main_loop, @on_main_alttp);
@@ -790,6 +793,16 @@ class VanillaSMMappping : ROMMapping{
 // See ../mxf-item-rando/js/rom_patcher.js patchRandomizerFlag().
 const uint32 MxfRandomizerFlagAddr = 0x008004;
 
+// X-Fusion "Skip DMX" seed option: the item randomizer bakes a single byte into the
+// RandoStartTable (SNES bank $85, table base $85:8210) marking whether this seed lets
+// the player bypass the DMX sector entirely (0x01) or requires playing through its
+// item-wipe/MDK-alarm quarantine sequence normally (0x00). See
+// ../mxf-item-rando/js/rom_patcher.js writeRandoStartTable() / L.skipDMX (table offset
+// 0x4A). The table lives in a bank-$80+ mirror, so it reads the same regardless of
+// whether this ROM is FastROM- or SlowROM-patched (unlike register_pc_intercepts()'s
+// `fastrom`-adjusted addresses, which target code originally assembled in bank $00-$3F).
+const uint32 MxfSkipDmxFlagAddr = 0x85825A;
+
 class MetroidXFusionMapping : ROMMapping{
   // true if this is a seed produced by the mxf-item-rando item randomizer, false for
   // the unmodified vanilla X-Fusion ROM. Both variants share the same WRAM layout and
@@ -798,12 +811,27 @@ class MetroidXFusionMapping : ROMMapping{
   // it's tracked for diagnostics and in case that changes later.
   bool is_randomized;
 
+  // see MxfSkipDmxFlagAddr above.
+  bool skip_dmx;
+
   MetroidXFusionMapping() {
     super();
     is_randomized = bus::read_u8(MxfRandomizerFlagAddr) != 0;
-    message("X-Fusion ROM variant: " + (is_randomized ? "randomized" : "vanilla"));
+    // the RandoStartTable (and the skipDMX byte within it) is only ever written by the
+    // item randomizer's patcher -- on a vanilla, non-randomized ROM that space holds
+    // whatever arbitrary bytes the base ROM has there, NOT a meaningful off/on flag. A
+    // stray nonzero byte would otherwise be misread as "Skip DMX is on", which would
+    // incorrectly change mxf_force_dmx_strip()'s Wave Beam handling (LocalGameState.as)
+    // -- note this no longer affects whether the DMX/MDK-alarm lockout itself trips at
+    // all (see is_mxf_locked_out() in GameState.as); that check is unconditional now,
+    // since the wipe happens regardless of this seed option. So only trust it for
+    // randomized seeds.
+    skip_dmx = is_randomized && (bus::read_u8(MxfSkipDmxFlagAddr) != 0);
+    message("X-Fusion ROM variant: " + (is_randomized ? "randomized" : "vanilla") + ", Skip DMX: " + (skip_dmx ? "on" : "off"));
     update_syncables();
   }
+
+  bool mxf_skip_dmx() override { return skip_dmx; }
 
   void update_syncables() {
     //metroid items
