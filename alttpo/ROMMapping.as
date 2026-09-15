@@ -840,7 +840,11 @@ class MetroidXFusionMapping : ROMMapping{
                  whenSyncItems(@SyncableItem(0x06, 1, 2, @nameForXFusionBeams, true)),
                  whenSyncItems(@SyncableItem(0x07, 1, 1, null, true)), // charge beam
                  whenSyncItems(@SyncableItem(0x26, 1, @mutateMxfMissileCapacity, null, true)), // missile capacity, capped at MxfMaxMissileCapacity
-                 whenSyncItems(@SyncableItem(0x2a, 1, 1, null, true)), // super missile capacity
+                 // NOTE: offset 0x2a (WRAM $7E09CC) is "super missile capacity" in vanilla SM,
+                 // but X-Fusion has no Super Missile ammo type -- it repurposes this byte as the
+                 // AQA sector's local water level. It must NOT be synced (previously merged via
+                 // "highest wins", which forced one player's water level onto everyone else's,
+                 // breaking their room's water animation/state).
                  whenSyncItems(@SyncableItem(0x2e, 1, @mutateMxfPowerBombCapacity, null, true)), // power bomb capacity, capped at MxfMaxPowerBombCapacity
                  whenSyncItems(@SyncableItem(0x32, 2, @mutateMxfReserveCapacity, null, true)), // reserve-X capacity, capped at MxfMaxReserveTanks
                  whenSyncItems(@SyncableItem(0x22, 2, @mutateMxfEnergyCapacity, null, true)), // energy capacity, capped at MxfMaxETanks
