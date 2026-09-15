@@ -168,6 +168,8 @@ class LocalGameState : GameState {
   void reset() override {
     GameState::reset();
 
+    mxf_reset_flag_notifications();
+
     small_keys_current.reset();
     last_sent = 0;
 
@@ -1382,15 +1384,18 @@ class LocalGameState : GameState {
 
   void fetch_sm_events() {
     uint32 start = get_in_sm()? 0x7ED820 : 0xa16070;
-  
-    for (int i = 0; i < 0x14; i++) {
+
+    for (int i = 0; i < SmEventsBlock1Size; i++) {
       sm_events[i] = bus::read_u8(start + i);
     }
-    for (int i = 0; i < 0x20; i++) {
-      sm_events[i + 0x14] = bus::read_u8(start + 0x50 + i);
+    if (rom.is_mxf()) {
+      sm_events[MxfEventIdx_Adam] = bus::read_u8(start + MxfEventIdx_Adam);
     }
-    for (int i = 0; i < 0x20; i++) {
-      sm_events[i + 0x14 + 0x20] = bus::read_u8(start + 0x90 + i);
+    for (int i = 0; i < SmEventsBlock2Size; i++) {
+      sm_events[i + SmEventsBlock2Offset] = bus::read_u8(start + SmEventsBlock2WramOffs + i);
+    }
+    for (int i = 0; i < SmEventsBlock3Size; i++) {
+      sm_events[i + SmEventsBlock3Offset] = bus::read_u8(start + SmEventsBlock3WramOffs + i);
     }
   }
 
@@ -1811,7 +1816,7 @@ class LocalGameState : GameState {
   void serialize_sm_events(array<uint8> &r) {
     r.write_u8(uint8(0x0D));
 
-    for (int i = 0; i < 0x54; i++) {
+    for (int i = 0; i < SmEventsSize; i++) {
       r.write_u8(sm_events[i]);
     }
     
@@ -2454,6 +2459,10 @@ class LocalGameState : GameState {
   }
 
   void update_items(SRAM@ d, bool is_sm_sram) {
+    // don't sync X-Fusion item capacities while mid-DMX-transition or physically in
+    // DMX, to avoid softlocking the local player (no-op for non-mxf ROMs):
+    if (is_sm_sram && is_mxf_dmx_lockout()) return;
+
     if (!get_in_sm()) {
       if (is_it_a_bad_time()) return;
 
@@ -3275,7 +3284,65 @@ class LocalGameState : GameState {
     p = send_packet(envelope, p);
   }
 
+  // true while the local player is physically standing in the DMX sector itself
+  // ($7E079F). Item capacities and game flags must not be synced from other players
+  // during this window, or the MDK alarm / "return from DMX" sequence can desync and
+  // softlock the local player. Always false for non-mxf ROMs (vanilla SM/SMZ3 have no
+  // DMX sector).
+  //
+  // NOTE: this deliberately does NOT also check sm_events[MxfEventIdx_CurrentArea] (WRAM
+  // 0x7ED820), even though that mirrors the same 0-7 area encoding. That byte is merged
+  // across the whole team with max() (see update_sm_events()), so it only ever goes up --
+  // once any teammate's area value reaches DMX even briefly, it latches there permanently
+  // for the entire team, which would make this lockout permanent instead of temporary.
+  // sm_area, read fresh from WRAM every frame, is the only part of this that's actually
+  // transient.
+  bool is_mxf_dmx_lockout() {
+    if (!rom.is_mxf()) return false;
+    if (!get_in_sm()) return false;
+    if (sm_area == MxfSectorDMX) return true;
+    return false;
+  }
+
+  // WRAM 0x7ED820 (MxfEventIdx_CurrentArea) is a plain value, not a bitfield -- notify
+  // once when it newly settles on one of the six "Aux Power Engaged" areas. MDK (0, the
+  // starting area) and DMX (7, handled by the alarm/lockout logic) don't get this
+  // notification, matching the areas that actually have an "Aux Power Engaged" event.
+  void notify_mxf_area_engaged(uint8 oldValue, uint8 newValue) {
+    if (oldValue == newValue) return;
+    if (newValue < MxfArea_SRX || newValue > MxfArea_NOC) return;
+    notify("Auxiliary Engaged (" + mxfAreaNames[newValue] + ")");
+  }
+
+  // scans every entry in mxfFlagNotes and notifies for each one whose bit newly
+  // transitioned from 0 to 1 between oldEvents and the current sm_events (i.e. as a
+  // result of merging in another player's flags -- see update_sm_events()).
+  void notify_mxf_flags(const array<uint8> @oldEvents) {
+    for (uint n = 0; n < mxfFlagNotes.length(); n++) {
+      auto @note = mxfFlagNotes[n];
+      if (note.notified) continue;
+      uint8 mask = uint8(1) << note.bit;
+      if ((oldEvents[note.idx] & mask) != 0) continue;
+      if ((sm_events[note.idx] & mask) == 0) continue;
+      note.notified = true;
+      notify(mxf_flag_note_text(note));
+    }
+  }
+
   void update_sm_events() {
+    if (is_mxf_dmx_lockout()) return;
+
+    bool isMxf = rom.is_mxf();
+
+    // full snapshot of the pre-merge state, so notify_mxf_flags() and
+    // notify_mxf_area_engaged() can tell which changes came from other players.
+    // Meaningless (and unused) for non-mxf ROMs.
+    array<uint8> oldEvents;
+    if (isMxf) {
+      oldEvents.resize(SmEventsSize);
+      for (int i = 0; i < SmEventsSize; i++) oldEvents[i] = sm_events[i];
+    }
+
     uint len = players.length();
 
     for (uint i = 0; i < len; i++) {
@@ -3285,24 +3352,42 @@ class LocalGameState : GameState {
       if (remote.ttl <= 0) continue;
       if (remote.team != team) continue;
 
-      for (int j = 0; j < 0x54; j++) {
-        sm_events[j] = remote.sm_events[j] | sm_events[j];
+      for (int j = 0; j < SmEventsSize; j++) {
+        if (isMxf && j == MxfEventIdx_CurrentArea) {
+          // not a bitfield: OR-ing two valid area values together can produce a third
+          // value neither player actually has, so take the higher of the two instead.
+          if (remote.sm_events[j] > sm_events[j]) sm_events[j] = remote.sm_events[j];
+        } else {
+          sm_events[j] = remote.sm_events[j] | sm_events[j];
+        }
       }
     }
 
     uint start = get_in_sm() ? 0x7ED820 : 0xa16070;
 
-    for (int i = 0; i < 0x14; i++) {
+    // write the merged flags back to WRAM BEFORE running any notification logic below.
+    // notify_mxf_flags() does live bus:: reads (Core-X reward table / PLM addresses) to
+    // build its text; if any of that ever fails, it must not be able to stop the actual
+    // game-state sync from landing -- notifications are cosmetic, the WRAM write isn't.
+    for (int i = 0; i < SmEventsBlock1Size; i++) {
       bus::write_u8(start + i, sm_events[i]);
     }
-    for (int i = 0; i < 0x20; i++) {
-      bus::write_u8(start + 0x50 + i, sm_events[i + 0x14]);
+    if (isMxf) {
+      bus::write_u8(start + MxfEventIdx_Adam, sm_events[MxfEventIdx_Adam]);
     }
-    for (int i = 0; i < 0x20; i++) {
-      bus::write_u8(start + 0x90 + i, sm_events[i + 0x14 + 0x20]);
+    for (int i = 0; i < SmEventsBlock2Size; i++) {
+      bus::write_u8(start + SmEventsBlock2WramOffs + i, sm_events[i + SmEventsBlock2Offset]);
+    }
+    for (int i = 0; i < SmEventsBlock3Size; i++) {
+      bus::write_u8(start + SmEventsBlock3WramOffs + i, sm_events[i + SmEventsBlock3Offset]);
+    }
+
+    if (isMxf) {
+      notify_mxf_area_engaged(oldEvents[MxfEventIdx_CurrentArea], sm_events[MxfEventIdx_CurrentArea]);
+      notify_mxf_flags(oldEvents);
     }
   }
-  
+
   void update_games_won() {
     uint len = players.length();
 

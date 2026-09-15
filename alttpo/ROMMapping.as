@@ -26,6 +26,9 @@ abstract class ROMMapping {
 
   bool is_alttp() { return true; }
   bool is_sm()  { return false;}
+  // true only for the Metroid X-Fusion romhack (mxf); false for vanilla SM and SMZ3,
+  // which also answer is_sm()==true but have a different WRAM game-flag layout.
+  bool is_mxf() { return false; }
   void register_pc_intercepts() {
     // intercept at PC=`JSR ClearOamBuffer; JSL MainRouting`:
     cpu::register_pc_interceptor(rom.fn_pre_main_loop, @on_main_alttp);
@@ -781,10 +784,24 @@ class VanillaSMMappping : ROMMapping{
 
 }
 
-class MetroidXFusionMappping : ROMMapping{
+// X-Fusion (mxf) randomizer detection: the item randomizer writes 0x01 at PC/file
+// offset 0x000004 to mark a seed as randomized (0x00 = vanilla base ROM). For a LoROM
+// ROM with no copier header, that file offset maps to SNES bus address $00:8004.
+// See ../mxf-item-rando/js/rom_patcher.js patchRandomizerFlag().
+const uint32 MxfRandomizerFlagAddr = 0x008004;
 
-  MetroidXFusionMappping() {
+class MetroidXFusionMapping : ROMMapping{
+  // true if this is a seed produced by the mxf-item-rando item randomizer, false for
+  // the unmodified vanilla X-Fusion ROM. Both variants share the same WRAM layout and
+  // item/flag locations (the randomizer only shuffles which item is found where, not
+  // the world's room/pickup structure), so nothing here currently branches on it --
+  // it's tracked for diagnostics and in case that changes later.
+  bool is_randomized;
+
+  MetroidXFusionMapping() {
     super();
+    is_randomized = bus::read_u8(MxfRandomizerFlagAddr) != 0;
+    message("X-Fusion ROM variant: " + (is_randomized ? "randomized" : "vanilla"));
     update_syncables();
   }
 
@@ -794,16 +811,17 @@ class MetroidXFusionMappping : ROMMapping{
                  whenSyncItems(@SyncableItem(0x03, 1, 2, @nameForXFusionBoots, true)),
                  whenSyncItems(@SyncableItem(0x06, 1, 2, @nameForXFusionBeams, true)),
                  whenSyncItems(@SyncableItem(0x07, 1, 1, null, true)), // charge beam
-                 whenSyncItems(@SyncableItem(0x26, 1, 1, null, true)), // missile capacity
+                 whenSyncItems(@SyncableItem(0x26, 1, @mutateMxfMissileCapacity, null, true)), // missile capacity, capped at MxfMaxMissileCapacity
                  whenSyncItems(@SyncableItem(0x2a, 1, 1, null, true)), // super missile capacity
-                 whenSyncItems(@SyncableItem(0x2e, 1, 1, null, true)), // power bomb capacity
-                 whenSyncItems(@SyncableItem(0x32, 2, 1, null, true)), // reserve tanks
-                 whenSyncItems(@SyncableItem(0x22, 2, 1, null, true)), // energy tanks
+                 whenSyncItems(@SyncableItem(0x2e, 1, @mutateMxfPowerBombCapacity, null, true)), // power bomb capacity, capped at MxfMaxPowerBombCapacity
+                 whenSyncItems(@SyncableItem(0x32, 2, @mutateMxfReserveCapacity, null, true)), // reserve-X capacity, capped at MxfMaxReserveTanks
+                 whenSyncItems(@SyncableItem(0x22, 2, @mutateMxfEnergyCapacity, null, true)), // energy capacity, capped at MxfMaxETanks
                 };
   }
 
   bool is_alttp() override { return false; }
   bool is_sm() override { return true; }
+  bool is_mxf() override { return true; }
 
   void register_pc_intercepts() override {
     // SM main is at 0x82893D (PHK; PLB)
@@ -933,7 +951,7 @@ ROMMapping@ detect() {
      return VanillaSMMappping();
   } else if (title == "M3 X-Fusion Hack     "){
     message("recognized X-Fusion");
-    return MetroidXFusionMappping();
+    return MetroidXFusionMapping();
   } else {
     switch (region) {
       case 0x00:

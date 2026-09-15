@@ -194,7 +194,11 @@ class SyncableItem {
     uint8 eold;
     uint8 enew;
     uint8 old_count;
-    uint8 diff;
+    // NOTE: must be uint16, not uint8: energy/reserve capacity diffs can exceed 255
+    // (e.g. joining a player who already has multiple E-Tanks/Reserve tanks synced in
+    // at once), and a uint8 here would silently wrap around, producing bogus notification
+    // text like "Got 0 Reserve Tanks" instead of the real count.
+    uint16 diff;
     switch (offs) {
       case 0x02:
         eold = bus::read_u8(base + offs - 2);
@@ -233,30 +237,47 @@ class SyncableItem {
         old_count = bus::read_u8(base + offs - 2);
         diff = newValue - oldValue;
         bus::write_u8(base + offs - 2, old_count + diff);
-        local.notify("Got " + fmtInt(diff) + " Missiles");
+        // X-Fusion: the per-location tank flags in mxfFlagNotes already notify for
+        // this pickup with its real location (see notify_mxf_flags() in
+        // LocalGameState.as); notifying here too would just duplicate it.
+        if (!rom.is_mxf()) local.notify("Got " + fmtInt(diff) + " Missiles");
         break;
       case 0x2a:
         old_count = bus::read_u8(base + offs - 2);
         diff = newValue - oldValue;
         bus::write_u8(base + offs - 2, old_count + diff);
-        local.notify("Got " + fmtInt(diff) + " Super Missiles");
+        if (!rom.is_mxf()) local.notify("Got " + fmtInt(diff) + " Super Missiles");
         break;
       case 0x2e:
         old_count = bus::read_u8(base + offs - 2);
         diff = newValue - oldValue;
         bus::write_u8(base + offs - 2, old_count + diff);
-        local.notify("Got " + fmtInt(diff) + " Power Bombs");
+        if (!rom.is_mxf()) local.notify("Got " + fmtInt(diff) + " Power Bombs");
         break;
       case 0x22:
         bus::write_u16(base + offs - 2, bus::read_u16(base + offs));
-        diff = newValue - oldValue;
-        if (diff/100 == 1) local.notify("Got " + fmtInt(diff/100) + " Energy Tank");
-        else local.notify("Got " + fmtInt(diff/100) + " Energy Tanks");
+        // X-Fusion: the per-location tank flags in mxfFlagNotes already notify for
+        // this pickup with its real location (see notify_mxf_flags() in
+        // LocalGameState.as); notifying here too would just duplicate it.
+        if (!rom.is_mxf()) {
+          diff = newValue - oldValue;
+          if (diff/100 == 1) local.notify("Got " + fmtInt(diff/100) + " Energy Tank");
+          else local.notify("Got " + fmtInt(diff/100) + " Energy Tanks");
+        }
         break;
        case 0x32:
-        diff = newValue - oldValue;
-        if (diff/100 == 1) local.notify("Got " + fmtInt(diff/100) + " Reserve Tank");
-        else local.notify("Got " + fmtInt(diff/100) + " Reserve Tanks");
+        // X-Fusion's Reserve-X tanks don't fill immediately on pickup -- capacity
+        // ramps up gradually as it "charges", so diff here is rarely a clean multiple
+        // of 100 and this notify would routinely fire as "Got 0 Reserve-X" while that
+        // charge (or a synced partial-charge merge from another player) is in
+        // progress. The per-location Reserve-X flags in mxfFlagNotes (see
+        // notify_mxf_flags() in LocalGameState.as) notify reliably instead, once per
+        // actual pickup, with the real randomized item and location.
+        if (!rom.is_mxf()) {
+          diff = newValue - oldValue;
+          if (diff/100 == 1) local.notify("Got " + fmtInt(diff/100) + " Reserve Tank");
+          else local.notify("Got " + fmtInt(diff/100) + " Reserve Tanks");
+        }
         break;
       default: return;
     }
@@ -523,6 +544,50 @@ uint16 mutateZeroToNonZero(SRAM@ localSRAM, uint16 oldValue, uint16 newValue) {
   // Allow if replacing 'no item':
   if (oldValue == 0 && newValue != 0) return newValue;
   return oldValue;
+}
+
+// X-Fusion (mxf): hard ceilings on synced capacities, so a bad merge (e.g. a
+// duplicated pickup, or a remote whose own state has somehow gone out of bounds) can
+// never push a local capacity past what's actually obtainable in-game. Used only by
+// MetroidXFusionMapping.update_syncables() in ROMMapping.as -- vanilla SM/SMZ3 have
+// different (unmodified) capacity limits and aren't affected by these.
+const uint16 MxfMaxMissileCapacity    = 99;
+const uint16 MxfMaxPowerBombCapacity  = 50;
+
+const uint16 MxfBaseEnergyCapacity    = 99;  // starting energy capacity with zero E-Tanks
+const uint16 MxfEnergyPerETank        = 100;
+const uint16 MxfMaxETanks             = 14;
+const uint16 MxfMaxEnergyCapacity     = MxfBaseEnergyCapacity + MxfMaxETanks * MxfEnergyPerETank;
+
+const uint16 MxfEnergyPerReserveTank  = 100;
+const uint16 MxfMaxReserveTanks       = 7;
+const uint16 MxfMaxReserveCapacity    = MxfMaxReserveTanks * MxfEnergyPerReserveTank;
+
+// takes the higher of old/new (same as the "highest wins" merge type), then clamps to
+// cap. Never returns less than oldValue, even if oldValue is already above cap (from
+// state that predates this cap), so we only ever refuse to grant *more* than the cap
+// allows -- we don't claw back anything the player already legitimately has.
+uint16 mutateMxfCappedHighest(uint16 oldValue, uint16 newValue, uint16 cap) {
+  uint16 v = (newValue > oldValue) ? newValue : oldValue;
+  if (v > cap) v = cap;
+  if (v < oldValue) v = oldValue;
+  return v;
+}
+
+uint16 mutateMxfMissileCapacity(SRAM@ localSRAM, uint16 oldValue, uint16 newValue) {
+  return mutateMxfCappedHighest(oldValue, newValue, MxfMaxMissileCapacity);
+}
+
+uint16 mutateMxfPowerBombCapacity(SRAM@ localSRAM, uint16 oldValue, uint16 newValue) {
+  return mutateMxfCappedHighest(oldValue, newValue, MxfMaxPowerBombCapacity);
+}
+
+uint16 mutateMxfEnergyCapacity(SRAM@ localSRAM, uint16 oldValue, uint16 newValue) {
+  return mutateMxfCappedHighest(oldValue, newValue, MxfMaxEnergyCapacity);
+}
+
+uint16 mutateMxfReserveCapacity(SRAM@ localSRAM, uint16 oldValue, uint16 newValue) {
+  return mutateMxfCappedHighest(oldValue, newValue, MxfMaxReserveCapacity);
 }
 
 uint16 mutateFlute(SRAM@ localSRAM, uint16 oldValue, uint16 newValue) {
@@ -823,7 +888,7 @@ const array<string> @xfusionvariable2Names =  { "Super Jump",
 
 const array<string> @xfusionvariable3Names =  { "Wave Beam",
                                                 "Ice Beam",
-                                                "Spazer",
+                                                "Wide Beam",
                                                 "Plasma",
                                                 "Blank9",
                                                 "Blank10",
@@ -869,3 +934,319 @@ const array<string> @randomizerItems2Names = { "",
 
 void nameForRandomizerItems1(uint16 old, uint16 new, NotifyItemReceived @notify) { notifyBitfieldItem(randomizerItems1Names, notify, old, new); }
 void nameForRandomizerItems2(uint16 old, uint16 new, NotifyItemReceived @notify) { notifyBitfieldItem(randomizerItems2Names, notify, old, new); }
+
+// X-Fusion (mxf) sm_events flag notifications -- see update_sm_events() in
+// LocalGameState.as, which only consults these when rom.is_mxf() is true.
+
+// value (not bit!) -> area name for 7ED820, X-Fusion's "current area" byte:
+const array<string> @mxfAreaNames = { "MDK", "SRX", "TRO", "PYR", "AQA", "ARC", "NOC", "DMX" };
+
+// index (0x00-0x11) -> display name for a major item, as written into either the
+// Core-X reward table or a shuffled major-item PLM's arg high byte -- see
+// mxf_corex_item_name()/mxf_plm_item_name() below and ../mxf-item-rando's
+// mxf_data_bundle.json data.items.upgradeItems, which this list's order matches.
+const array<string> @mxfMajorItemNames = {
+  "Morph Ball", "Bombs", "Charge Beam", "Super Jump", "Super Missile", "Grapple Beam",
+  "Speed Booster", "Wide Beam", "Varia Suit", "Ice Beam", "Space Jump", "Spike Breaker",
+  "Plasma", "Gravity Suit", "Wave Beam", "Screw Attack", "Diffusion Missile", "Lv.2 Speed Booster",
+};
+
+// special (non-index) values written into the Core-X reward table / a major-item PLM's
+// arg high byte, instead of an index into mxfMajorItemNames:
+const uint16 MxfRewardArg_Nothing  = 0xF0;
+const uint16 MxfRewardArg_ETank    = 0xF1; // Core-X table only; PLMs use a dedicated type instead
+const uint16 MxfRewardArg_Missile  = 0xF2; // Core-X table only; PLMs use a dedicated type instead
+const uint16 MxfRewardArg_PowerBomb = 0xF3; // Core-X table only; PLMs use a dedicated type instead
+const uint16 MxfRewardArg_ReserveX = 0xF4;
+
+// resolves a raw reward value (from either the Core-X table, which stores it directly,
+// or a major-item PLM's arg high byte, which uses the same low byte of these F0-F4
+// constants) to a display name.
+string mxf_reward_item_name(uint16 v) {
+  if (v == MxfRewardArg_Nothing)   return "Nothing";
+  if (v == MxfRewardArg_ETank)     return "E-Tank";
+  if (v == MxfRewardArg_Missile)   return "Missiles";
+  if (v == MxfRewardArg_PowerBomb) return "PBs";
+  if (v == MxfRewardArg_ReserveX)  return "Reserve-X";
+  if (v < mxfMajorItemNames.length()) return mxfMajorItemNames[v];
+  return "an item";
+}
+
+// X-Fusion's "Core-X Reward Lookup Table": a fixed-size table the item randomizer
+// writes into, mapping each of the 25 boss/Data Room/Reserve-X locations (by a fixed
+// index -- see the MxfCoreX() calls below) to whatever item that seed actually placed
+// there. PC (ROM file) address 0x028000, 0x10 bytes/entry, reward value as a 16-bit
+// word at the start of each entry. See ../mxf-item-rando/js/rom_patcher.js
+// applyMajorItemLocationPlacements()/writeCoreXEntry()/computeCoreXRewardValue() for
+// the address, layout, and encoding this mirrors.
+const uint32 MxfCoreXRewardTableAddr = 0x058000; // PC 0x028000 -> LoROM bus address
+const uint32 MxfCoreXRewardEntrySize = 0x10;
+
+string mxf_corex_item_name(uint8 tableIndex) {
+  uint16 v = bus::read_u16(MxfCoreXRewardTableAddr + uint32(tableIndex) * MxfCoreXRewardEntrySize);
+  // the Core-X table stores expansion rewards as 0xFFF0-0xFFF4 (see
+  // computeCoreXRewardValue()) rather than the bare 0xF0-0xF4 a PLM's arg byte uses:
+  if (v >= 0xFFF0 && v <= 0xFFF4) return mxf_reward_item_name(uint16(v & 0xFF));
+  return mxf_reward_item_name(v);
+}
+
+// PLM "type" values used for missile/PB/energy tank pickups (visible & hidden variants
+// each), and the two "major item" PLM types used instead when a full item shuffle
+// placed a major item at that location. See ../mxf-item-rando/js/rom_patcher.js
+// getExpansionPlmType()/writePLMDataPC() for the values this mirrors. A PLM is 8 bytes
+// -- [X:2][Y:2][type:2][arg:2] -- and our stored address points at the type field.
+const uint16 MxfPlmType_MissileTank         = 0x8A3E;
+const uint16 MxfPlmType_MissileTankHidden   = 0x8A4A;
+const uint16 MxfPlmType_EnergyTank          = 0x8A3A;
+const uint16 MxfPlmType_EnergyTankHidden    = 0x8A46;
+const uint16 MxfPlmType_PowerBombTank       = 0x8A42;
+const uint16 MxfPlmType_PowerBombTankHidden = 0x8A4E;
+const uint16 MxfPlmType_MajorItem           = 0xD5A4;
+const uint16 MxfPlmType_MajorItemHidden     = 0xD5A8;
+
+// resolves the item actually configured at a tank/expansion PLM address, whether it's
+// still an expansion tank or was shuffled into a major item. Returns "" if the PLM type
+// isn't one we recognize, so the caller can fall back to plain location text.
+string mxf_plm_item_name(uint32 plmAddr) {
+  uint16 plmType = bus::read_u16(plmAddr);
+  if (plmType == MxfPlmType_MissileTank || plmType == MxfPlmType_MissileTankHidden) return "Missiles";
+  if (plmType == MxfPlmType_EnergyTank || plmType == MxfPlmType_EnergyTankHidden) return "E-Tank";
+  if (plmType == MxfPlmType_PowerBombTank || plmType == MxfPlmType_PowerBombTankHidden) return "PBs";
+  if (plmType == MxfPlmType_MajorItem || plmType == MxfPlmType_MajorItemHidden) {
+    uint16 arg = bus::read_u16(plmAddr + 4);
+    return mxf_reward_item_name(uint16(arg >> 8));
+  }
+  return "";
+}
+
+// one entry in the table below: sm_events[idx] bit `bit`, newly set -> notify(...).
+// `text` is either the complete notification text (MxfStatic), or a "<Location>"/
+// "Defeated <Boss>" prefix that gets " -- <actual item>" appended at notify time, read
+// live from the ROM so it reflects the real seed rather than a hardcoded vanilla guess
+// (MxfCoreX for the 25 boss/Data Room/Reserve-X locations, MxfPlm for everything else).
+class MxfFlagNote {
+  int idx;
+  uint8 bit;
+  string text;
+  int coreXIndex; // >=0: resolve via mxf_corex_item_name()
+  uint32 plmAddr;  // >0: resolve via mxf_plm_item_name()
+  // some of these WRAM bits appear to get toggled back off by the game itself under
+  // conditions we don't fully understand (rather than staying permanently set once
+  // collected, as the "game flag" framing implies) -- seen in practice as the same
+  // pickup notifying repeatedly. Latching per-entry once we've notified for it, rather
+  // than trusting the WRAM bit to stay set, makes each one fire at most once per
+  // session regardless of what the underlying byte does afterward.
+  bool notified = false;
+
+  MxfFlagNote(int idx, uint8 bit, const string &in text, int coreXIndex, uint32 plmAddr) {
+    this.idx = idx;
+    this.bit = bit;
+    this.text = text;
+    this.coreXIndex = coreXIndex;
+    this.plmAddr = plmAddr;
+  }
+}
+
+MxfFlagNote@ MxfStatic(int idx, uint8 bit, const string &in text) {
+  return MxfFlagNote(idx, bit, text, -1, 0);
+}
+MxfFlagNote@ MxfCoreX(int idx, uint8 bit, const string &in text, int coreXIndex) {
+  return MxfFlagNote(idx, bit, text, coreXIndex, 0);
+}
+MxfFlagNote@ MxfPlm(int idx, uint8 bit, const string &in text, uint32 plmAddr) {
+  return MxfFlagNote(idx, bit, text, -1, plmAddr);
+}
+
+// "a"/"an" for a vowel-leading item name; "" for names that don't take an indefinite
+// article at all (a plural, or "Nothing").
+// the full notification text for a note, resolving a live item lookup if it has one:
+// "Got <item> (<location>)" for a resolved item (no article -- kept short for screen
+// space, e.g. "Got PBs (Wrecked Storage)"), else just the location/story text.
+string mxf_flag_note_text(MxfFlagNote@ note) {
+  string item;
+  if (note.coreXIndex >= 0) {
+    item = mxf_corex_item_name(uint8(note.coreXIndex));
+  } else if (note.plmAddr != 0) {
+    item = mxf_plm_item_name(note.plmAddr);
+  } else {
+    return note.text;
+  }
+  if (item.length() == 0) return note.text; // unrecognized item state; fall back to plain location text
+
+  return "Got " + item + " (" + note.text + ")";
+}
+
+// Every X-Fusion sm_events bit we notify on: Etecoons saved, Aux Power Cells,
+// Talking-to-Adam hints, boss Core-X kills, and every individually-flagged item pickup
+// (missile/PB/energy tanks, Reserve-X tanks, and Data Room downloads -- the randomizer
+// shuffles what's found at each of these locations same as anything else, so we read
+// the real placed item live rather than hardcode the vanilla one). `idx` is the
+// sm_events[] array index (see GameState.as for how WRAM addresses map to it); location/
+// boss text is taken verbatim from ../mxf-json-data's items.json (gameFlags.boss /
+// gameFlags.item), cross-verified against every row having a real captured timestamp in
+// docs/Super Metroid_ X-Fusion - Game Flags Documentation. Core-X table indices are
+// from ../mxf-item-rando/js/rom_patcher.js's locationToCoreXIndex; PLM addresses are
+// from ../mxf-item-rando/mxf_data_bundle.json's room node data (converted from PC/file
+// offset to a LoROM bus address). Neo-Crocomire has no Core-X reward -- it's simply
+// "Defeated", unlike the other boss kills which all grant an item.
+const array<MxfFlagNote@> @mxfFlagNotes = {
+  MxfCoreX(8, 0, "Defeated Yakuza", 0xa),
+  MxfCoreX(9, 0, "Defeated Spikespawn", 0xb),
+  MxfCoreX(9, 2, "Defeated Arachnus-X", 0x0),
+  MxfCoreX(10, 0, "Defeated Nettori", 0xc),
+  MxfCoreX(10, 1, "Defeated Zazabi", 0x3),
+  MxfCoreX(11, 0, "Defeated Neo-Ridley", 0xf),
+  MxfCoreX(11, 1, "Defeated Phantomire", 0x5),
+  MxfCoreX(12, 0, "Defeated Meta Draygon-X", 0x11),
+  MxfCoreX(12, 1, "Defeated Serris", 0x6),
+  MxfCoreX(13, 0, "Defeated X-B.O.X.", 0xe),
+  MxfCoreX(13, 1, "Defeated ARC Navigation Room's Core-X", 0x7),
+  MxfCoreX(14, 0, "Defeated Nightmare", 0xd),
+  MxfCoreX(14, 1, "Defeated Barrier Core-X", 0x8),
+  MxfCoreX(1, 3, "SRX Data Room", 0x1),
+  MxfCoreX(1, 4, "TRO Data Room", 0x2),
+  MxfCoreX(1, 5, "PYR Data Room", 0x4),
+  MxfCoreX(1, 6, "ARC Data Room", 0x9),
+  MxfCoreX(1, 7, "AQA Data Room", 0x10),
+  MxfCoreX(8, 7, "Docking Bay", 0x12),
+  MxfCoreX(9, 7, "Just Don't Die Bend", 0x13),
+  MxfCoreX(10, 7, "TRO Reserve X Room", 0x14),
+  MxfCoreX(11, 7, "Boiler Room", 0x15),
+  MxfCoreX(12, 7, "AQA Reserve X Room", 0x16),
+  MxfCoreX(13, 7, "ARC Reserve X Room", 0x17),
+  MxfCoreX(14, 7, "NOC Reserve X Room", 0x18),
+  MxfStatic(11, 2, "Defeated Neo-Crocomire"),
+  MxfStatic(2, 1, "Etecoon Saved (SRX)"),
+  MxfStatic(2, 2, "Etecoon Saved (TRO)"),
+  MxfStatic(2, 3, "Etecoon Saved (PYR)"),
+  MxfStatic(2, 4, "Etecoon Saved (AQA)"),
+  MxfStatic(2, 5, "Etecoon Saved (ARC)"),
+  MxfStatic(2, 6, "Etecoon Saved (NOC)"),
+  MxfStatic(2, 7, "Etecoon Saved (MDK)"),
+  MxfStatic(6, 1, "Got Aux Power Cell (SRX)"),
+  MxfStatic(6, 2, "Got Aux Power Cell (TRO)"),
+  MxfStatic(6, 3, "Got Aux Power Cell (PYR)"),
+  MxfStatic(6, 4, "Got Aux Power Cell (AQA)"),
+  MxfStatic(6, 6, "Got Aux Power Cell (NOC)"),
+  MxfStatic(20, 0, "Got a Hint from Adam (MDK)"),
+  MxfStatic(20, 1, "Got a Hint from Adam (SRX)"),
+  MxfStatic(20, 2, "Got a Hint from Adam (TRO)"),
+  MxfStatic(20, 3, "Got a Hint from Adam (PYR)"),
+  MxfStatic(20, 4, "Got a Hint from Adam (PYR-Ridley)"),
+  MxfStatic(20, 5, "Got a Hint from Adam (AQA)"),
+  MxfStatic(20, 7, "Got a Hint from Adam (NOC)"),
+  MxfPlm(21, 1, "MDK-AQA Elevator Cache", 0xfd2d7),
+  MxfPlm(21, 2, "Nexus Storage", 0xfd339),
+  MxfPlm(21, 3, "Habitation Deck", 0xfd3cb),
+  MxfPlm(21, 4, "Habitation Deck", 0xfd3d1),
+  MxfPlm(21, 5, "Wrecked Storage", 0xfd3e1),
+  MxfPlm(21, 6, "Ventilation Speedway", 0xfd3f1),
+  MxfPlm(21, 7, "Operations Ventilation", 0xfd401),
+  MxfPlm(22, 0, "Operations Ventilation", 0xfd407),
+  MxfPlm(22, 1, "Crew Quarters", 0xfd415),
+  MxfPlm(22, 2, "Docking Bay Supply Room", 0xfd44d),
+  MxfPlm(22, 3, "Central Reactor Core", 0xfd45d),
+  MxfPlm(22, 4, "Silo Scaffolding", 0xfd46d),
+  MxfPlm(23, 0, "Moto Towerway", 0xfd5c5),
+  MxfPlm(23, 1, "SRX Entrance Lobby", 0xfd5e7),
+  MxfPlm(23, 2, "Hornoad Hole", 0xfd609),
+  MxfPlm(23, 3, "Fool's Dead End", 0xfd661),
+  MxfPlm(23, 4, "Lava Horseshoe", 0xfd699),
+  MxfPlm(23, 5, "Lava Lake", 0xfd6bd),
+  MxfPlm(23, 6, "SRX-NOC Elevator Access", 0xfd72d),
+  MxfPlm(23, 7, "Searpent's Coil", 0xfd6f9),
+  MxfPlm(24, 0, "Vacuum Verge", 0xfd701),
+  MxfPlm(25, 0, "TRO Entrance Lobby Storage", 0xfd75d),
+  MxfPlm(25, 1, "Crumble Crossing", 0xfd96d),
+  MxfPlm(25, 2, "Puyo Palace", 0xfd787),
+  MxfPlm(25, 3, "Reo Courtyard", 0xfd7a7),
+  MxfPlm(25, 4, "TRO-PYR Access", 0xfd7af),
+  MxfPlm(25, 5, "Crumble City", 0xfd7cb),
+  MxfPlm(25, 6, "Crumble City", 0xfd7c5),
+  MxfPlm(25, 7, "Cultivation Station", 0xfd7df),
+  MxfPlm(26, 0, "Owtch Office", 0xfd7f3),
+  MxfPlm(26, 1, "Zazabi Arena Access", 0xfd82b),
+  MxfPlm(26, 2, "Zazabi Speedway", 0xfd859),
+  MxfPlm(26, 3, "Overgrown Cache", 0xfd867),
+  MxfPlm(26, 4, "Oasis Storage", 0xfd8a9),
+  MxfPlm(26, 5, "Thornvault", 0xfd909),
+  MxfPlm(26, 6, "Needlepoint", 0xfd955),
+  MxfPlm(27, 0, "Garbage Chute", 0xfda03),
+  MxfPlm(27, 1, "Garbage Chute", 0xfda09),
+  MxfPlm(27, 2, "Sova Processing Access", 0xfda11),
+  MxfPlm(27, 3, "Sova Processing", 0xfda1f),
+  MxfPlm(27, 4, "Bob's Abode", 0xfda33),
+  MxfPlm(27, 5, "Overthinking Chamber", 0xfda55),
+  MxfPlm(27, 6, "Big Red Maintenance Storage", 0xfda69),
+  MxfPlm(27, 7, "Big Red Maintenance Storage", 0xfda6f),
+  MxfPlm(28, 0, "Geron's Treasure", 0xfdab1),
+  MxfPlm(28, 1, "PYR-MDK Access", 0xfdae9),
+  MxfPlm(28, 2, "Hot Potato", 0xfdafd),
+  MxfPlm(28, 3, "Bubble Storage", 0xfdb1b),
+  MxfPlm(28, 4, "Elevator to Neo-Ridley", 0xfdb8b),
+  MxfPlm(28, 5, "PYR Security Room Access", 0xfdc43),
+  MxfPlm(29, 0, "Reservoir East", 0xfdc83),
+  MxfPlm(29, 1, "Reservoir Vault", 0xfdc91),
+  MxfPlm(29, 2, "Hydrospark", 0xfdca9),
+  MxfPlm(29, 3, "AQA Mimic Colony", 0xfdce9),
+  MxfPlm(29, 4, "Owtch Corridor", 0xfdcf1),
+  MxfPlm(29, 5, "Broken Bridge", 0xfdd19),
+  MxfPlm(29, 6, "Buoyant Bridge", 0xfdd29),
+  MxfPlm(29, 7, "Drowned Junction", 0xfdd6b),
+  MxfPlm(30, 0, "Cheddar Bay", 0xfdd79),
+  MxfPlm(30, 1, "Cheddar Bay", 0xfddb1),
+  MxfPlm(30, 2, "Gamepad Room", 0xfddcf),
+  MxfPlm(30, 3, "Skree Firing Range", 0xfddd7),
+  MxfPlm(30, 4, "Serris Speedway", 0xfde0d),
+  MxfPlm(30, 5, "Sunken Treasury", 0xfde71),
+  MxfPlm(31, 0, "Weapons Testing Grounds", 0xfdeed),
+  MxfPlm(31, 1, "Gerubus Gully", 0xfdf43),
+  MxfPlm(31, 2, "ARC-PYR Access", 0xfdf51),
+  MxfPlm(31, 3, "Crow's Nest", 0xfdf5f),
+  MxfPlm(31, 4, "Zeela Speedway Cache", 0xfdfb7),
+  MxfPlm(31, 5, "Frostbite Nook", 0xfdff1),
+  MxfPlm(31, 6, "Frostbite Hall", 0xfdfeb),
+  MxfPlm(31, 7, "Frozen Tower", 0xfdfff),
+  MxfPlm(32, 0, "Transmutation Trial", 0xfe00b),
+  MxfPlm(32, 1, "Cryopipe", 0xfe04b),
+  MxfPlm(32, 2, "Arctic Gauntlet", 0xfe053),
+  MxfPlm(32, 3, "Freezer Shaft West", 0xfe09f),
+  MxfPlm(33, 0, "Mochtroid Tower Closet", 0xfe14b),
+  MxfPlm(33, 1, "Stabilizer Shaft", 0xfe153),
+  MxfPlm(33, 2, "Ripper Tower", 0xfe185),
+  MxfPlm(33, 3, "Ripper Tower", 0xfe18b),
+  MxfPlm(33, 4, "Pillar Highway", 0xfe1ad),
+  MxfPlm(33, 5, "NOC Entrance Lobby South", 0xfe1c3),
+  MxfPlm(33, 6, "NOC Mimic Lodge", 0xfe1d9),
+  MxfPlm(33, 7, "Ice-X Shaft", 0xfe1ed),
+  MxfPlm(34, 1, "Shiverclimb", 0xfe1b5),
+  MxfPlm(34, 2, "Nocturnal Crossroads", 0xfe27b),
+  // Security Room doors unlocking, and SA-X encounters ending -- the two mxf event
+  // types worth surfacing to the player even though most sm_events bits sync silently.
+  MxfStatic(4, 3, "SA-X Encounter Finished (Sanctum)"),
+  MxfStatic(4, 4, "SA-X Chase Over (Turbo Tunnel)"),
+  MxfStatic(5, 0, "SA-X Encounter Finished (Underpressure)"),
+  MxfStatic(15, 0, "SA-X True Form Destroyed"),
+  MxfStatic(53, 4, "Security Doors Unlocked (MDK)"),
+  MxfStatic(57, 0, "Security Doors Unlocked (TRO)"),
+  MxfStatic(60, 1, "Security Doors Unlocked (PYR)"),
+  MxfStatic(61, 3, "Security Doors Unlocked (AQA North)"),
+  MxfStatic(61, 6, "Security Doors Unlocked (AQA South)"),
+  MxfStatic(62, 2, "Security Doors Unlocked (AQA East)"),
+  MxfStatic(63, 6, "Security Doors Unlocked (ARC)"),
+};
+
+// clears every entry's notified latch; called from LocalGameState::reset() so a script
+// reload (or a manual reset from the settings window) starts fresh rather than staying
+// permanently silenced for the rest of the emulator session.
+void mxf_reset_flag_notifications() {
+  // LocalGameState::reset() calls this as early as cartridge_loaded(), which can fire
+  // before this file's own global initializer for mxfFlagNotes has finished -- the
+  // array itself can exist (non-null) while its individual elements are still
+  // default-null handles pending their own constructor calls, so guard both.
+  if (mxfFlagNotes is null) return;
+  for (uint n = 0; n < mxfFlagNotes.length(); n++) {
+    if (mxfFlagNotes[n] is null) continue;
+    mxfFlagNotes[n].notified = false;
+  }
+}

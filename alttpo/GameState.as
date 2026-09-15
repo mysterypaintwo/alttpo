@@ -218,6 +218,64 @@ bool players_updated = false;
 const uint lttp_uniq4bpptile_count = 0x4F0 + 4;
 const uint   sm_uniq4bpptile_count = 0xF00;
 
+// sm_events mirrors game-flag bytes starting at WRAM 0x7ED820 (or 0xa16070 when read
+// via the ALTTP-side temp storage). This layout is shared by every SM-based ROM type
+// (vanilla SM, SMZ3, and the X-Fusion romhack / mxf) for network-format compatibility;
+// see fetch_sm_events()/update_sm_events() in LocalGameState.as for how these are read
+// from and written back to WRAM, and serialize/deserialize_sm_events() for how the
+// whole array is sent over the network.
+const int SmEventsBlock1Size = 0x14; // WRAM 0x7ED820..0x7ED833 (block 1 starts at offset 0, so no separate WramOffs constant is needed)
+
+// X-Fusion repurposes WRAM 0x7ED834 -- in the gap between block 1 and block 2 that
+// vanilla SM/SMZ3 don't use for anything we sync -- for its own "Talking to Adam"
+// flags. This slot is reserved in the array for every ROM type so the network layout
+// and block 2/3 offsets stay fixed, but it is only ever read from or written back to
+// WRAM when rom.is_mxf() is true (see fetch_sm_events()/update_sm_events()).
+const int MxfEventIdx_Adam = SmEventsBlock1Size; // 0x14; WRAM 0x7ED834
+
+const int SmEventsBlock2Size     = 0x20;
+const int SmEventsBlock2Offset   = MxfEventIdx_Adam + 1; // 0x15
+const int SmEventsBlock2WramOffs = 0x50; // WRAM 0x7ED870..0x7ED88F
+
+const int SmEventsBlock3Size     = 0x20;
+const int SmEventsBlock3Offset   = SmEventsBlock2Offset + SmEventsBlock2Size; // 0x35
+const int SmEventsBlock3WramOffs = 0x90; // WRAM 0x7ED8B0..0x7ED8CF
+
+// WRAM 0x7ED802..0x7ED81F (below block 1) is deliberately NOT synced here. Every row the
+// docs/Super Metroid_ X-Fusion - Game Flags Documentation CSV has for that range is typed
+// "Unknown" -- mostly save-station bits that flip on/off repeatedly as the player moves
+// between save points (not the monotonic "set once" shape OR-merging assumes), plus one
+// cluster at 0x7ED810..0x7ED817 that all flip together once, labeled only "might be
+// related to DMX Chase Room States". Syncing bytes we don't understand the meaning of is
+// how we got the DMX/MDK-alarm lockout regression -- stick to blocks 1-3, which cover
+// only rows the CSV types as Item Collection / Story Progression / Optional Event.
+const int SmEventsSize = SmEventsBlock3Offset + SmEventsBlock3Size; // 0x55
+
+// mxf-specific byte indices within sm_events (all within block 1's WRAM range, which
+// starts at 0x7ED820). Interpreting these bytes this way is only valid for X-Fusion --
+// vanilla SM/SMZ3 have different, unrelated flags at these same WRAM addresses, so
+// every place that reads these must first check rom.is_mxf().
+//
+// NOTE: unlike the other mxf bytes here, WRAM 0x7ED820 (MxfEventIdx_CurrentArea) is NOT
+// a bitfield -- it's a single "current area" value 0-7 (0=MDK, 1=SRX, 2=TRO, 3=PYR,
+// 4=AQA, 5=ARC, 6=NOC, 7=DMX). It must never be merged with bitwise OR like the other
+// bytes (OR-ing two valid small integers together can produce a third value neither
+// player actually has); see update_sm_events() in LocalGameState.as, which
+// special-cases this index (only for mxf ROMs) to take the higher of the two instead.
+const int MxfEventIdx_CurrentArea  = 0x7ED820 - 0x7ED820;
+
+// X-Fusion "current area" values (see MxfEventIdx_CurrentArea above and $7E079F sm_area):
+const uint8 MxfArea_MDK = 0;
+const uint8 MxfArea_SRX = 1;
+const uint8 MxfArea_TRO = 2;
+const uint8 MxfArea_PYR = 3;
+const uint8 MxfArea_AQA = 4;
+const uint8 MxfArea_ARC = 5;
+const uint8 MxfArea_NOC = 6;
+const uint8 MxfArea_DMX = 7;
+
+const uint8 MxfSectorDMX = MxfArea_DMX; // value of WRAM 0x7E079F while in the DMX sector
+
 class GameState {
   int ttl;        // time to live for last update packet
   int index = -1; // player index in server's array (local is always -1)
@@ -402,7 +460,7 @@ class GameState {
   array<uint8> sram(0x1500);
   array<uint8> sm_sram(0x40);
 
-  array<uint8> sm_events(0x54);
+  array<uint8> sm_events(SmEventsSize);
 
   SyncableByte@ crystal = @SyncableByte(0xC172);
   array<SyncableByte@> small_keys(0x10);
@@ -492,7 +550,7 @@ class GameState {
       sm_sram[i] = 0;
     }
 
-    for (uint i = 0; i < 0x50; i++) {
+    for (uint i = 0; i < SmEventsSize; i++) {
       sm_events[i] = 0;
     }
 
@@ -1211,7 +1269,7 @@ class GameState {
   }
 
   int deserialize_sm_events(array<uint8> r, int c) {
-    for (int i = 0; i < 0x54; i++) {
+    for (int i = 0; i < SmEventsSize; i++) {
         sm_events[i] = r[c++];
     }
     sm_clear = r[c++];
