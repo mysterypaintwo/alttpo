@@ -1322,6 +1322,20 @@ class GameState {
       justJoined = false;
     }
 
+    // X-Fusion: mxf_enforce_dmx_lockout() sends a one-shot "<name> Left (Entered
+    // DMX)" rename (bypassing the normal send() rate limit) as its last act before
+    // disconnecting -- this is the ONLY packet that reliably leaves that client once
+    // it enters DMX (see is_mxf_locked_out() above for why sm_area/MDK-bit alone
+    // can't be trusted to arrive). Latch the lockout the instant this is received,
+    // rather than waiting on a live area/bit check that may never come, or on the
+    // ordinary ~4s ttl decay to eventually drop them. Match on "Left (" (right at the
+    // start of the appended suffix) rather than the full marker text, since namePadded
+    // is truncated to 20 chars and a longer original name would otherwise cut off a
+    // marker positioned later in the string.
+    if (rom.is_mxf() && stringContains(name, "Left (")) {
+      mxf_dmx_locked = true;
+    }
+
     return c;
   }
 

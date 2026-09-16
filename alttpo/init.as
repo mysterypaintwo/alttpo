@@ -166,6 +166,19 @@ string padTo(string value, int len) {
   return newValue;
 }
 
+// true if `needle` occurs anywhere in `haystack`. Used to spot a marker substring
+// inside a name that may have been truncated (e.g. by padTo()) to an arbitrary cut
+// point, so a fixed-position or prefix check isn't reliable.
+bool stringContains(const string &in haystack, const string &in needle) {
+  int nlen = int(needle.length());
+  int hlen = int(haystack.length());
+  if (nlen == 0) return true;
+  for (int i = 0; i + nlen <= hlen; i++) {
+    if (haystack.slice(i, i + nlen) == needle) return true;
+  }
+  return false;
+}
+
 
 LocalGameState@ local = null;
 array<GameState@> players(0);

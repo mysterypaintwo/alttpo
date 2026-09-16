@@ -317,7 +317,12 @@ void pre_frame() {
     if (remote is null) continue;
     playerCount++;
     if (remote is local) continue;
-    if (remote.ttl <= 0) {
+    // is_mxf_locked_out() also catches a remote latched into the X-Fusion DMX
+    // lockout (see deserialize_name()'s "Left (Entered DMX)" handling and
+    // mxf_enforce_dmx_lockout()) -- treat them the same as an expired ttl so their
+    // last-synced (pre-strip, fully equipped) sprite stops being drawn immediately
+    // instead of lingering for up to the full ttl decay window:
+    if (remote.ttl <= 0 || is_mxf_locked_out(remote)) {
       // erase player:
       remote.ttl = 0;
       if (remote.index >= 0) {

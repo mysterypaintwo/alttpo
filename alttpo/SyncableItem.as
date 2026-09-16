@@ -869,10 +869,10 @@ const array<string> @variable3Names = { "Wave Beam",
                                         "" };
 
 const array<string> @xfusionvariable1Names = {  "Varia Suit",
-                                                "Lv.2 Missile",
+                                                "Super Missile",
                                                 "Morph Ball",
                                                 "Screw Attack",
-                                                "Lv.4 Missile",
+                                                "Diffusion Missile",
                                                 "Gravity Suit",
                                                 "Blank2",
                                                 "Spike Breaker" };
@@ -884,7 +884,7 @@ const array<string> @xfusionvariable2Names =  { "Super Jump",
                                                 "Bombs",
                                                 "Lv.1 Speed Booster",
                                                 "Grapple Beam",
-                                                "Lv.3 Missile" };
+                                                "Ice Missile" };
 
 const array<string> @xfusionvariable3Names =  { "Wave Beam",
                                                 "Ice Beam",
@@ -947,7 +947,7 @@ const array<string> @mxfAreaNames = { "MDK", "SRX", "TRO", "PYR", "AQA", "ARC", 
 // mxf_data_bundle.json data.items.upgradeItems, which this list's order matches.
 const array<string> @mxfMajorItemNames = {
   "Morph Ball", "Bombs", "Charge Beam", "Super Jump", "Super Missile", "Grapple Beam",
-  "Speed Booster", "Wide Beam", "Varia Suit", "Ice Beam", "Space Jump", "Spike Breaker",
+  "Speed Booster", "Wide Beam", "Varia Suit", "Ice Missile", "Space Jump", "Spike Breaker",
   "Plasma", "Gravity Suit", "Wave Beam", "Screw Attack", "Diffusion Missile", "Lv.2 Speed Booster",
 };
 
@@ -1072,6 +1072,12 @@ string mxf_flag_note_text(MxfFlagNote@ note) {
     return note.text;
   }
   if (item.length() == 0) return note.text; // unrecognized item state; fall back to plain location text
+
+  // the missile ladder is progressive (Super -> Ice -> Diffusion) rather than a
+  // one-off pickup, so phrase it as an upgrade like the sword/shield/glove tiers do:
+  if (item == "Super Missile" || item == "Ice Missile" || item == "Diffusion Missile") {
+    return "Upgraded to " + item + " (" + note.text + ")";
+  }
 
   return "Got " + item + " (" + note.text + ")";
 }
@@ -1223,7 +1229,7 @@ const array<MxfFlagNote@> @mxfFlagNotes = {
   MxfPlm(34, 2, "Nocturnal Crossroads", 0xfe27b),
   // Security Room doors unlocking, and SA-X encounters ending -- the two mxf event
   // types worth surfacing to the player even though most sm_events bits sync silently.
-  MxfStatic(4, 3, "SA-X Encounter Finished (Sanctum)"),
+  MxfStatic(4, 3, "SA-X Encounter Finished (Crum-Ball Tower)"),
   MxfStatic(4, 4, "SA-X Chase Over (Turbo Tunnel)"),
   MxfStatic(5, 0, "SA-X Encounter Finished (Underpressure)"),
   MxfStatic(15, 0, "SA-X True Form Destroyed"),
