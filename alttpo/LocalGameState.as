@@ -208,6 +208,7 @@ class LocalGameState : GameState {
     GameState::reset();
 
     mxf_reset_flag_notifications();
+    mxf_prev_cycle_sm_events_valid = false;
 
     small_keys_current.reset();
     last_sent = 0;
@@ -3351,6 +3352,11 @@ class LocalGameState : GameState {
   // mxf_force_dmx_strip() to decide whether Wave Beam needs to be force-granted.
   bool mxf_had_wave_before_wipe = false;
 
+  // sm_events as of the END of the last update_sm_events() cycle (i.e. right after
+  // that cycle's remote merge already landed) -- see check_mxf_room_flags() below.
+  array<uint8> mxf_prev_cycle_sm_events;
+  bool mxf_prev_cycle_sm_events_valid = false;
+
   // Primary DMX-entry detection: identifies the DMX entry transition itself (the
   // specific MDK room/door pair, mid-transition, with all 6 auxiliaries engaged)
   // instead of waiting for the item wipe to already be visible in WRAM. When this
@@ -3600,6 +3606,45 @@ class LocalGameState : GameState {
     }
   }
 
+  // resolves and fires any room-ambiguous flag (mxfRoomFlagNotes in SyncableItem.as)
+  // whose bit newly transitioned from 0 to 1 purely due to OUR OWN live WRAM state --
+  // i.e. between `prevEvents` (sm_events as of the END of the last update_sm_events()
+  // cycle, right after that cycle's remote merge already landed) and `curEvents`
+  // (this cycle's snapshot, taken at the top of update_sm_events() after this frame's
+  // own fetch_sm_events() but before THIS cycle's remote merge runs). Any
+  // remote-merge-caused bit is necessarily already present in `prevEvents` too
+  // (merges only ever happen inside update_sm_events(), and prevEvents was captured
+  // right after the last one ran) -- so a bit that's newly set here can only have
+  // come from the local player's own progress since the last cycle (at most ~16
+  // frames), meaning the current live room ID (WRAM 0x7E079B) genuinely reflects
+  // where it happened. This is the mirror image of notify_mxf_flags() (remote-only,
+  // since a local change is always already absorbed into ITS "old" snapshot before it
+  // ever gets to compare) -- that's what surfaces a teammate's completion instead, via
+  // the room-unspecified fallback entry sharing the same idx/bit in mxfFlagNotes.
+  void check_mxf_room_flags(const array<uint8> @prevEvents, const array<uint8> @curEvents) {
+    if (mxfRoomFlagNotes is null) return;
+    uint16 curRoomId = 0;
+    bool haveRoomId = false;
+    for (uint n = 0; n < mxfRoomFlagNotes.length(); n++) {
+      auto @note = mxfRoomFlagNotes[n];
+      if (note is null) continue;
+      if (note.notified) continue;
+      uint8 mask = uint8(1) << note.bit;
+      if ((prevEvents[note.idx] & mask) != 0) continue;
+      if ((curEvents[note.idx] & mask) == 0) continue;
+      note.notified = true;
+      if (!haveRoomId) {
+        curRoomId = bus::read_u16(0x7E079B);
+        haveRoomId = true;
+      }
+      if (curRoomId == note.roomIdA) notify(note.textA);
+      else if (curRoomId == note.roomIdB) notify(note.textB);
+      // else: not physically in either configured room right now -- shouldn't
+      // normally happen for a genuinely local change, so stay silent rather than
+      // guess wrong.
+    }
+  }
+
   void update_sm_events() {
     if (is_mxf_dmx_lockout()) return;
 
@@ -3612,6 +3657,10 @@ class LocalGameState : GameState {
     if (isMxf) {
       oldEvents.resize(SmEventsSize);
       for (int i = 0; i < SmEventsSize; i++) oldEvents[i] = sm_events[i];
+
+      if (mxf_prev_cycle_sm_events_valid) {
+        check_mxf_room_flags(mxf_prev_cycle_sm_events, oldEvents);
+      }
     }
 
     uint len = players.length();
@@ -3671,6 +3720,14 @@ class LocalGameState : GameState {
     if (isMxf) {
       notify_mxf_area_engaged(oldEvents[MxfEventIdx_CurrentArea], sm_events[MxfEventIdx_CurrentArea]);
       notify_mxf_flags(oldEvents);
+
+      // snapshot this cycle's final (post-merge) state as next cycle's "prev"
+      // baseline for check_mxf_room_flags() above:
+      if (mxf_prev_cycle_sm_events.length() != SmEventsSize) {
+        mxf_prev_cycle_sm_events.resize(SmEventsSize);
+      }
+      for (int i = 0; i < SmEventsSize; i++) mxf_prev_cycle_sm_events[i] = sm_events[i];
+      mxf_prev_cycle_sm_events_valid = true;
     }
   }
 

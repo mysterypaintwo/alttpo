@@ -1082,6 +1082,55 @@ string mxf_flag_note_text(MxfFlagNote@ note) {
   return "Got " + item + " (" + note.text + ")";
 }
 
+// one sm_events bit the game engine reuses for two physically distinct, room-specific
+// events (see mxfRoomFlagNotes below) -- e.g. WRAM 0x7ED824 bit 3 sets on finishing
+// EITHER the Sanctum OR the Crum-Ball Tower SA-X encounter, with no other bit to tell
+// them apart. `roomIdA`/`roomIdB` are WRAM 0x7E079B ("RoomID") values, read live at
+// the moment the bit is confirmed to have transitioned due to OUR OWN progress (see
+// check_mxf_room_flags() in LocalGameState.as) to pick the right text. The case where
+// a TEAMMATE's progress synced the bit in instead of ours -- where there's no way to
+// know which room they were in -- isn't handled here at all; it stays deliberately
+// vague via the ordinary room-unspecified MxfStatic entry sharing this same idx/bit
+// in mxfFlagNotes/notify_mxf_flags() below instead, rather than risk guessing wrong.
+class MxfRoomText {
+  uint16 roomId;
+  string text;
+  MxfRoomText(uint16 roomId, const string &in text) {
+    this.roomId = roomId;
+    this.text = text;
+  }
+}
+
+class MxfRoomFlagNote {
+  int idx;
+  uint8 bit;
+  uint16 roomIdA;
+  string textA;
+  uint16 roomIdB;
+  string textB;
+  bool notified = false;
+
+  MxfRoomFlagNote(int idx, uint8 bit, uint16 roomIdA, const string &in textA, uint16 roomIdB, const string &in textB) {
+    this.idx = idx;
+    this.bit = bit;
+    this.roomIdA = roomIdA;
+    this.textA = textA;
+    this.roomIdB = roomIdB;
+    this.textB = textB;
+  }
+}
+
+MxfRoomFlagNote@ MxfRoomFlag(int idx, uint8 bit, uint16 roomIdA, const string &in textA, uint16 roomIdB, const string &in textB) {
+  return MxfRoomFlagNote(idx, bit, roomIdA, textA, roomIdB, textB);
+}
+
+// add an entry here (alongside a room-unspecified MxfStatic(...) fallback of the same
+// idx/bit in mxfFlagNotes above, for the teammate-synced case) any time another sm_events
+// bit turns up that's shared between multiple physically distinct rooms/events:
+const array<MxfRoomFlagNote@> @mxfRoomFlagNotes = {
+  MxfRoomFlag(4, 3, 0x968B, "SA-X Encounter Finished (Sanctum)", 0x984D, "SA-X Encounter Finished (Crum-Ball Tower)"),
+};
+
 // Every X-Fusion sm_events bit we notify on: Etecoons saved, Aux Power Cells,
 // Talking-to-Adam hints, boss Core-X kills, and every individually-flagged item pickup
 // (missile/PB/energy tanks, Reserve-X tanks, and Data Room downloads -- the randomizer
@@ -1229,7 +1278,14 @@ const array<MxfFlagNote@> @mxfFlagNotes = {
   MxfPlm(34, 2, "Nocturnal Crossroads", 0xfe27b),
   // Security Room doors unlocking, and SA-X encounters ending -- the two mxf event
   // types worth surfacing to the player even though most sm_events bits sync silently.
-  MxfStatic(4, 3, "SA-X Encounter Finished (Crum-Ball Tower)"),
+  // idx 4 bit 3 is shared between the Sanctum and Crum-Ball Tower SA-X encounters (no
+  // other bit distinguishes them) -- this entry only ever fires for a TEAMMATE's
+  // progress syncing in (see notify_mxf_flags()'s doc comment: a local change is
+  // always already absorbed before it gets here), where we have no way to know which
+  // room they were in, hence the deliberately room-unspecified text. Our OWN
+  // completion is instead caught precisely, by room, via mxfRoomFlagNotes above /
+  // check_mxf_room_flags() in LocalGameState.as.
+  MxfStatic(4, 3, "SA-X Encounter Finished (Sanctum or Crum-Ball Tower)"),
   MxfStatic(4, 4, "SA-X Chase Over (Turbo Tunnel)"),
   MxfStatic(5, 0, "SA-X Encounter Finished (Underpressure)"),
   MxfStatic(15, 0, "SA-X True Form Destroyed"),
@@ -1250,9 +1306,16 @@ void mxf_reset_flag_notifications() {
   // before this file's own global initializer for mxfFlagNotes has finished -- the
   // array itself can exist (non-null) while its individual elements are still
   // default-null handles pending their own constructor calls, so guard both.
-  if (mxfFlagNotes is null) return;
-  for (uint n = 0; n < mxfFlagNotes.length(); n++) {
-    if (mxfFlagNotes[n] is null) continue;
-    mxfFlagNotes[n].notified = false;
+  if (mxfFlagNotes !is null) {
+    for (uint n = 0; n < mxfFlagNotes.length(); n++) {
+      if (mxfFlagNotes[n] is null) continue;
+      mxfFlagNotes[n].notified = false;
+    }
+  }
+  if (mxfRoomFlagNotes !is null) {
+    for (uint n = 0; n < mxfRoomFlagNotes.length(); n++) {
+      if (mxfRoomFlagNotes[n] is null) continue;
+      mxfRoomFlagNotes[n].notified = false;
+    }
   }
 }
